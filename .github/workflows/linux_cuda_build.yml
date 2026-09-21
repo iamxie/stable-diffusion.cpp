@@ -1,0 +1,138 @@
+name: sd.cpp Linux CUDA Build
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 每天台灣時間 11:00 AM 自動執行 (UTC 03:00)
+  workflow_dispatch:     # 保留手動按鈕，方便隨時測試或強制重編
+
+# 建立 Release 需要寫入權限（新 repo 的 GITHUB_TOKEN 預設可能只有讀取權限）
+permissions:
+  contents: write
+
+# 避免排程和手動觸發同時跑兩份
+concurrency:
+  group: sdcpp-cuda-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check Upstream Tag
+        id: check_tag
+        run: |
+          # sd.cpp 的 tag 格式是 master-<流水號>-<commit>，例如 master-889-c678dfe
+          # 上游還留著一批舊格式 master-<commit>（沒有流水號），用 sort -V 會誤選到舊版，
+          # 所以先用正規表示式過濾，再依流水號數字排序
+          LATEST_TAG=$(git ls-remote --tags --refs https://github.com/leejet/stable-diffusion.cpp 'master-*' \
+            | awk -F/ '{print $3}' \
+            | grep -E '^master-[0-9]+-[0-9a-f]+$' \
+            | sort -t- -k2,2n \
+            | tail -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            echo "抓不到上游 tag"
+            exit 1
+          fi
+          echo "上游最新版本為: $LATEST_TAG"
+          echo "TAG=$LATEST_TAG" >> "$GITHUB_ENV"
+          # 智慧去重：這個版本已經發佈過就跳過（手動觸發時強制重編）
+          if gh release view "$LATEST_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+             && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "該版本 $LATEST_TAG 已經發佈過，跳過本日定時編譯。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "準備編譯新版本 $LATEST_TAG"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch Source
+        if: steps.check_tag.outputs.skip != 'true'
+        run: |
+          git clone --depth 1 --branch "$TAG" https://github.com/leejet/stable-diffusion.cpp sdcpp
+          # 只需要 ggml 子模組；WebP、WebM、網頁前端用不到
+          git -C sdcpp submodule update --init --depth 1 ggml
+
+      - name: Install Build Tools
+        if: steps.check_tag.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget ca-certificates ninja-build lld build-essential cmake ccache
+
+      - name: Install CUDA Toolkit
+        if: steps.check_tag.outputs.skip != 'true'
+        run: |
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-12-9
+
+      - name: Configure CMake
+        if: steps.check_tag.outputs.skip != 'true'
+        run: |
+          export PATH=/usr/local/cuda-12.9/bin${PATH:+:${PATH}}
+          export LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+          # $ORIGIN 要原封不動交給 CMake（代表「執行檔所在的資料夾」），所以刻意用單引號
+          # shellcheck disable=SC2016
+          cmake -S sdcpp -B sdcpp/build -G Ninja \
+            -DSD_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;100;120" \
+            -DSD_WEBP=OFF \
+            -DSD_WEBM=OFF \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA_GRAPHS=ON \
+            -DCMAKE_C_FLAGS="-march=x86-64-v3" \
+            -DCMAKE_CXX_FLAGS="-march=x86-64-v3" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -fuse-ld=lld" \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build sd.cpp
+        if: steps.check_tag.outputs.skip != 'true'
+        run: |
+          export PATH=/usr/local/cuda-12.9/bin${PATH:+:${PATH}}
+          export LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+          cmake --build sdcpp/build --config Release --target sd-cli sd-server -j"$(nproc)"
+
+      - name: Prepare and Package Artifacts
+        if: steps.check_tag.outputs.skip != 'true'
+        run: |
+          export LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+          mkdir -p release
+          cp sdcpp/build/bin/sd-cli sdcpp/build/bin/sd-server release/
+          # cuBLAS 一定是動態連結，連同 cudart（如果有動態依賴）一起放進包裡
+          # 驅動本身（libcuda.so.1）由目標機器提供，不打包
+          for lib in $(ldd release/sd-cli | awk '/libcudart|libcublas/ && $3 ~ /^\// {print $3}'); do
+            cp -L "$lib" release/
+          done
+          # 確認執行檔會先到自己所在的資料夾找函式庫
+          readelf -d release/sd-cli | grep -E 'RPATH|RUNPATH' \
+            || { echo "sd-cli 沒有 RPATH，打包的 CUDA 函式庫不會被載入"; exit 1; }
+          printf 'sd.cpp %s\nCUDA 12.9\nArch 75;80;86;89;90;100;120\n' "$TAG" > release/VERSION
+          ls -lh release
+          # 檔名固定，Colab 可以用 releases/latest/download/ 直接抓最新版
+          tar -czf sd-cpp-linux-cuda12.tar.gz -C release .
+
+      - name: Create GitHub Release
+        if: steps.check_tag.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: sd.cpp ${{ env.TAG }} (CUDA 12)
+          body: |
+            ### 🛠 編譯資訊
+            - **系統環境**: Ubuntu 22.04 (GLIBC 2.35)
+            - **CUDA 版本**: 12.9（已附 cudart、cuBLAS，目標機器只需要 NVIDIA 驅動）
+            - **支援架構**: 75, 80, 86, 89, 90, 100, 120
+            - **上游版本**: [leejet/stable-diffusion.cpp ${{ env.TAG }}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${{ env.TAG }})
+          draft: false
+          prerelease: false
+          files: |
+            sd-cpp-linux-cuda12.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
