@@ -1,11 +1,14 @@
 name: sd.cpp Linux CUDA Build
 
+# 放在 leejet/stable-diffusion.cpp 的 fork 裡使用。
+# 只負責「從上游 tag 原封不動編譯並發佈」，不修改任何原始碼。
+
 on:
   schedule:
-    - cron: '0 3 * * *'  # 每天台灣時間 11:00 AM 自動執行 (UTC 03:00)
+    - cron: '0 2 * * *'  # 每天台灣時間 10:00 AM 自動執行 (UTC 02:00)
   workflow_dispatch:     # 保留手動按鈕，方便隨時測試或強制重編
 
-# 建立 Release 需要寫入權限（新 repo 的 GITHUB_TOKEN 預設可能只有讀取權限）
+# 建立 Release 需要寫入權限（GITHUB_TOKEN 的預設權限可能只有讀取）
 permissions:
   contents: write
 
@@ -36,8 +39,12 @@ jobs:
           fi
           echo "上游最新版本為: $LATEST_TAG"
           echo "TAG=$LATEST_TAG" >> "$GITHUB_ENV"
+          # fork 裡的 release tag 加上 cuda12- 前綴：避免跟上游同名的 tag 指向不同 commit，
+          # 別人一看就知道這是自行編譯的版本
+          RELEASE_TAG="cuda12-$LATEST_TAG"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
           # 智慧去重：這個版本已經發佈過就跳過（手動觸發時強制重編）
-          if gh release view "$LATEST_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
              && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "該版本 $LATEST_TAG 已經發佈過，跳過本日定時編譯。"
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -113,26 +120,37 @@ jobs:
           # 確認執行檔會先到自己所在的資料夾找函式庫
           readelf -d release/sd-cli | grep -E 'RPATH|RUNPATH' \
             || { echo "sd-cli 沒有 RPATH，打包的 CUDA 函式庫不會被載入"; exit 1; }
+          # 比照上游 release 的做法附上授權檔（MIT 要求散佈時附上版權與授權聲明）
+          cp sdcpp/LICENSE release/stable-diffusion.cpp.txt
+          cp sdcpp/ggml/LICENSE release/ggml.txt
           printf 'sd.cpp %s\nCUDA 12.9\nArch 75;80;86;89;90;100;120\n' "$TAG" > release/VERSION
           ls -lh release
           # 檔名固定，Colab 可以用 releases/latest/download/ 直接抓最新版
           tar -czf sd-cpp-linux-cuda12.tar.gz -C release .
+          sha256sum sd-cpp-linux-cuda12.tar.gz > sd-cpp-linux-cuda12.tar.gz.sha256
+          cat sd-cpp-linux-cuda12.tar.gz.sha256
 
       - name: Create GitHub Release
         if: steps.check_tag.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.TAG }}
-          name: sd.cpp ${{ env.TAG }} (CUDA 12)
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: sd.cpp ${{ env.TAG }} (Linux CUDA 12 build)
           body: |
             ### 🛠 編譯資訊
             - **系統環境**: Ubuntu 22.04 (GLIBC 2.35)
             - **CUDA 版本**: 12.9（已附 cudart、cuBLAS，目標機器只需要 NVIDIA 驅動）
             - **支援架構**: 75, 80, 86, 89, 90, 100, 120
             - **上游版本**: [leejet/stable-diffusion.cpp ${{ env.TAG }}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${{ env.TAG }})
+
+            ### 來源說明
+            - 由 GitHub Actions 從上游 tag 直接編譯，未修改任何原始碼
+            - 完整編譯記錄：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - 授權：stable-diffusion.cpp 與 ggml 皆為 MIT，授權檔已附在壓縮檔內
           draft: false
           prerelease: false
           files: |
             sd-cpp-linux-cuda12.tar.gz
+            sd-cpp-linux-cuda12.tar.gz.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
