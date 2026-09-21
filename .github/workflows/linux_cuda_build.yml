@@ -59,14 +59,27 @@ jobs:
         if: steps.check_tag.outputs.skip != 'true'
         run: |
           git clone --depth 1 --branch "$TAG" https://github.com/leejet/stable-diffusion.cpp sdcpp
-          # 只需要 ggml 子模組；WebP、WebM、網頁前端用不到
-          git -C sdcpp submodule update --init --depth 1 ggml
+          # 需要 ggml 和網頁介面（examples/server/frontend）兩個子模組；WebP、WebM 用不到
+          git -C sdcpp submodule update --init --depth 1 ggml examples/server/frontend
 
       - name: Install Build Tools
         if: steps.check_tag.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y wget ca-certificates ninja-build lld build-essential cmake ccache
+
+      # 比照上游 CI：用 Node 20 和 pnpm 10.15.1 編網頁介面，嵌進 sd-server
+      - name: Setup Node
+        if: steps.check_tag.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        if: steps.check_tag.outputs.skip != 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
 
       - name: Install CUDA Toolkit
         if: steps.check_tag.outputs.skip != 'true'
@@ -79,6 +92,7 @@ jobs:
       - name: Configure CMake
         if: steps.check_tag.outputs.skip != 'true'
         run: |
+          set -o pipefail
           export PATH=/usr/local/cuda-12.9/bin${PATH:+:${PATH}}
           export LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
           # $ORIGIN 要原封不動交給 CMake（代表「執行檔所在的資料夾」），所以刻意用單引號
@@ -88,7 +102,7 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;100;120" \
             -DSD_WEBP=OFF \
             -DSD_WEBM=OFF \
-            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_SERVER_BUILD_FRONTEND=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA_GRAPHS=ON \
             -DCMAKE_C_FLAGS="-march=x86-64-v3" \
@@ -97,7 +111,10 @@ jobs:
             -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release 2>&1 | tee cmake-configure.log
+          # 確認網頁介面有被嵌進 sd-server（找不到 pnpm 時 CMake 只會警告，不會失敗）
+          grep -q "HAVE_INDEX_HTML enabled" cmake-configure.log \
+            || { echo "網頁介面沒有被嵌入 sd-server"; exit 1; }
 
       - name: Build sd.cpp
         if: steps.check_tag.outputs.skip != 'true'
@@ -123,7 +140,8 @@ jobs:
           # 比照上游 release 的做法附上授權檔（MIT 要求散佈時附上版權與授權聲明）
           cp sdcpp/LICENSE release/stable-diffusion.cpp.txt
           cp sdcpp/ggml/LICENSE release/ggml.txt
-          printf 'sd.cpp %s\nCUDA 12.9\nArch 75;80;86;89;90;100;120\n' "$TAG" > release/VERSION
+          cp sdcpp/examples/server/frontend/LICENSE release/sdcpp-webui.txt
+          printf 'sd.cpp %s\nCUDA 12.9\nArch 75;80;86;89;90;100;120\nsd-server WebUI: embedded\n' "$TAG" > release/VERSION
           ls -lh release
           # 檔名固定，Colab 可以用 releases/latest/download/ 直接抓最新版
           tar -czf sd-cpp-linux-cuda12.tar.gz -C release .
@@ -141,12 +159,13 @@ jobs:
             - **系統環境**: Ubuntu 22.04 (GLIBC 2.35)
             - **CUDA 版本**: 12.9（已附 cudart、cuBLAS，目標機器只需要 NVIDIA 驅動）
             - **支援架構**: 75, 80, 86, 89, 90, 100, 120
+            - **sd-server**: 內建網頁介面，啟動後用瀏覽器開 http://127.0.0.1:1234/
             - **上游版本**: [leejet/stable-diffusion.cpp ${{ env.TAG }}](https://github.com/leejet/stable-diffusion.cpp/releases/tag/${{ env.TAG }})
 
             ### 來源說明
             - 由 GitHub Actions 從上游 tag 直接編譯，未修改任何原始碼
             - 完整編譯記錄：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            - 授權：stable-diffusion.cpp 與 ggml 皆為 MIT，授權檔已附在壓縮檔內
+            - 授權：stable-diffusion.cpp、ggml、sdcpp-webui 皆為 MIT，授權檔已附在壓縮檔內
           draft: false
           prerelease: false
           files: |
