@@ -1762,6 +1762,8 @@ bool StableDiffusionGGML::apply_loras(const sd_lora_t* loras, uint32_t lora_coun
         extension->collect_loras(all_loras);
     }
 
+    conditioning_cache_allowed_ = all_loras.empty();
+
     int64_t t0 = ggml_time_ms();
     end_runners();
     clear_lora_adapters();
@@ -2766,7 +2768,8 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
     auto decoded                      = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
     const bool prefer_temporal_tiling = decode_video && first_stage_model->can_temporal_tile_decode();
     while (decoded.empty() &&
-           sd::backend_fit::prepare_vae_decode_retry_tiling(vae_tiling_params, prefer_temporal_tiling)) {
+           sd::backend_fit::prepare_vae_decode_retry_tiling(vae_tiling_params, prefer_temporal_tiling,
+                                                            first_stage_model->last_compute_status())) {
         decoded = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
     }
     return decoded;
